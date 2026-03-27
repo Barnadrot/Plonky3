@@ -1,3 +1,4 @@
+// dft/src/radix_2_dit_parallel.rs
 use alloc::collections::BTreeMap;
 use alloc::slice;
 use alloc::sync::Arc;
@@ -6,7 +7,7 @@ use core::mem::{MaybeUninit, transmute};
 
 use itertools::{Itertools, izip};
 use p3_field::integers::QuotientMap;
-use p3_field::{Field, Powers, TwoAdicField};
+use p3_field::{Field, PackedField, PackedValue, Powers, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::bitrev::{BitReversalPerm, BitReversedMatrixView, BitReversibleMatrix};
 use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView, RowMajorMatrixViewMut};
@@ -469,13 +470,24 @@ fn second_half_general<F: Field>(
             for layer in mid..log_h {
                 let layer_rev = log_h - 1 - layer;
                 let first_block = thread << (layer - mid);
-                dit_layer_rev(
-                    &mut submat,
-                    log_h,
-                    layer,
-                    twiddles_rev[layer_rev][first_block..].iter().copied(),
-                    backwards,
-                );
+                if layer_rev == 0 {
+                    // Last layer: half_block_size=1, each block is 2 rows.
+                    // Use a specialized flat loop to reduce per-block overhead.
+                    // Since blocks are independent, backwards flag only affects processing
+                    // order, not correctness; we always iterate forward for simplicity.
+                    dit_layer_rev_last(
+                        &mut submat,
+                        &twiddles_rev[0][first_block..],
+                    );
+                } else {
+                    dit_layer_rev(
+                        &mut submat,
+                        log_h,
+                        layer,
+                        twiddles_rev[layer_rev][first_block..].iter().copied(),
+                        backwards,
+                    );
+                }
                 backwards = !backwards;
             }
         });
@@ -729,6 +741,43 @@ fn dit_layer_rev<F: Field>(
         for (block, twiddle) in blocks_and_twiddles {
             let (lo, hi) = block.split_at_mut(half_block_size * width);
             DitButterfly(twiddle).apply_to_rows(lo, hi);
+        }
+    }
+}
+
+/// Specialized last layer of the second half: `layer_rev == 0`, so `half_block_size == 1`.
+///
+/// Each block is exactly 2 rows. Instead of iterating block-by-block with `chunks_mut(2*width)`
+/// and calling `DitButterfly::apply_to_rows` for each block (which broadcasts the twiddle into
+/// a packed field inside the call), we inline the broadcast and packed computation directly.
+///
+/// Since all blocks are independent, the processing order does not affect correctness, so we
+/// always iterate forward regardless of the `backwards` flag.
+///
+/// The twiddle slice provides one twiddle factor per block (row-pair), starting at `first_block`.
+fn dit_layer_rev_last<F: Field>(
+    submat: &mut RowMajorMatrixViewMut<'_, F>,
+    twiddles: &[F],
+) {
+    let width = submat.width();
+    // Each block is 2 rows = 2*width elements.
+    for (pair, &twiddle) in submat.values.chunks_mut(2 * width).zip(twiddles.iter()) {
+        let (lo, hi) = pair.split_at_mut(width);
+        // Pre-broadcast the scalar twiddle into a packed field once per block.
+        let twiddle_packed = F::Packing::from(twiddle);
+        let (lo_packed, lo_suffix) = F::Packing::pack_slice_with_suffix_mut(lo);
+        let (hi_packed, hi_suffix) = F::Packing::pack_slice_with_suffix_mut(hi);
+        for (lp, hp) in lo_packed.iter_mut().zip(hi_packed.iter_mut()) {
+            let x2t = *hp * twiddle_packed;
+            let new_lo = *lp + x2t;
+            *hp = *lp - x2t;
+            *lp = new_lo;
+        }
+        for (ls, hs) in lo_suffix.iter_mut().zip(hi_suffix.iter_mut()) {
+            let x2t = *hs * twiddle;
+            let new_lo = *ls + x2t;
+            *hs = *ls - x2t;
+            *ls = new_lo;
         }
     }
 }
