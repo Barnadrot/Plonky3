@@ -27,6 +27,7 @@ p3-monty-31 = { path = "../monty-31" }
 
 criterion.workspace = true
 rand.workspace = true
+proptest.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
