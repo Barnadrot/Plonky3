@@ -417,6 +417,10 @@ fn first_half_general_oop<F: Field>(
 /// The optional `scale` parameter is used to scale the matrix by a constant factor. Rather than
 /// doing a separate pass over memory, we fold the scaling into the first butterfly layer to
 /// eliminate an extra memory pass.
+///
+/// When there are at least 2 layers in the second half, the last two layers (layer_rev==1 and
+/// layer_rev==0) are fused into a single 4-row pass to reduce memory traffic, analogous to
+/// the same optimization in `second_half_general`.
 #[instrument(level = "debug", skip_all)]
 #[inline(always)] // To avoid branch on scale
 fn second_half<F: Field>(
@@ -426,6 +430,7 @@ fn second_half<F: Field>(
     scale: Option<F>,
 ) {
     let log_h = log2_strict_usize(mat.height());
+    let num_second_half_layers = log_h - mid;
 
     // max block size: 2^(log_h - mid)
     mat.par_row_chunks_exact_mut(1 << (log_h - mid))
@@ -433,12 +438,16 @@ fn second_half<F: Field>(
         .for_each(|(thread, mut submat)| {
             let mut backwards = false;
             let mut scale_applied = false;
-            for layer in mid..log_h {
+
+            // When there are >= 2 second-half layers, we fuse the last two (layer_rev==1 and
+            // layer_rev==0) into a single 4-row pass to reduce memory traffic.
+            // The general layers are mid .. log_h-2 (if fusing), else mid .. log_h.
+            let fuse_last_two = num_second_half_layers >= 2;
+            let general_end = if fuse_last_two { log_h - 2 } else { log_h };
+
+            for layer in mid..general_end {
                 let first_block = thread << (layer - mid);
                 if !scale_applied {
-                    // Fold the scale into the first butterfly layer to avoid a separate
-                    // memory pass. This merges the O(N) scaling step into the first O(N)
-                    // butterfly pass.
                     scale_applied = true;
                     dit_layer_rev_scaled(
                         &mut submat,
@@ -459,10 +468,41 @@ fn second_half<F: Field>(
                 }
                 backwards = !backwards;
             }
+
+            if fuse_last_two {
+                // Fuse the last two layers (layer_rev==1 and layer_rev==0) into a single
+                // 4-row pass to reduce memory traffic.
+                //
+                // In the flat bitrev_twiddles array for thread `t`:
+                //   layer=log_h-2 (layer_rev=1): first_block = t << (log_h-2-mid)
+                //   layer=log_h-1 (layer_rev=0): first_block = t << (log_h-1-mid)
+                let first_block_layer1 = thread << (log_h - 2 - mid);
+                let first_block_layer0 = thread << (log_h - 1 - mid);
+
+                if !scale_applied {
+                    // num_second_half_layers == 2: scale hasn't been applied yet.
+                    // Fold it into the fused last-two-layer pass.
+                    dit_layer_rev_last2_flat_scaled(
+                        &mut submat,
+                        &twiddles_rev[first_block_layer1..],
+                        &twiddles_rev[first_block_layer0..],
+                        scale,
+                    );
+                } else {
+                    dit_layer_rev_last2_flat(
+                        &mut submat,
+                        &twiddles_rev[first_block_layer1..],
+                        &twiddles_rev[first_block_layer0..],
+                    );
+                }
+            }
+
             // Handle case where there are no layers in the second half (mid == log_h).
             // In that case, we still need to apply the scale.
-            if !scale_applied && let Some(s) = scale {
-                submat.scale(s);
+            if !scale_applied && !fuse_last_two {
+                if let Some(s) = scale {
+                    submat.scale(s);
+                }
             }
         });
 }
@@ -868,7 +908,7 @@ fn dit_layer_rev_last<F: Field>(
 
 /// Fused last two layers of the second half: processes layer_rev==1 and layer_rev==0 together.
 ///
-/// Each "mega-block" is 4 rows: [r0, r1, r2, r3].
+/// Used in `second_half_general`. Each "mega-block" is 4 rows: [r0, r1, r2, r3].
 /// Layer rev==1 butterfly (half_block_size=2):
 ///   - block 0: twiddle1_0 applied to (r0, r2)
 ///   - block 1: twiddle1_1 applied to (r1, r3)
@@ -972,6 +1012,193 @@ fn dit_layer_rev_last2<F: Field>(
             *s1 = new_r0 - r1t;
             *s2 = new_r2 + r3t;
             *s3 = new_r2 - r3t;
+        }
+    }
+}
+
+/// Fused last two layers for `second_half` (flat bitrev_twiddles layout), without scaling.
+///
+/// In `second_half`, twiddles are stored in a single flat bit-reversed array. For thread `t`:
+/// - `twiddles1 = &twiddles_rev[t << (log_h-2-mid) ..]`: layer_rev==1, 1 twiddle per 4-row block
+/// - `twiddles0 = &twiddles_rev[t << (log_h-1-mid) ..]`: layer_rev==0, 2 twiddles per 4-row block
+///
+/// The butterfly computation is identical to `dit_layer_rev_last2`.
+fn dit_layer_rev_last2_flat<F: Field>(
+    submat: &mut RowMajorMatrixViewMut<'_, F>,
+    twiddles1: &[F],
+    twiddles0: &[F],
+) {
+    let width = submat.width();
+    for (quad, (&t1, t0_pair)) in submat
+        .values
+        .chunks_mut(4 * width)
+        .zip(twiddles1.iter().zip(twiddles0.chunks(2)))
+    {
+        let t0_a = t0_pair[0];
+        let t0_b = t0_pair[1];
+
+        let (r0, rest) = quad.split_at_mut(width);
+        let (r1, rest) = rest.split_at_mut(width);
+        let (r2, r3) = rest.split_at_mut(width);
+
+        let t1_packed = F::Packing::from(t1);
+        let t0a_packed = F::Packing::from(t0_a);
+        let t0b_packed = F::Packing::from(t0_b);
+
+        let (r0_packed, r0_suffix) = F::Packing::pack_slice_with_suffix_mut(r0);
+        let (r1_packed, r1_suffix) = F::Packing::pack_slice_with_suffix_mut(r1);
+        let (r2_packed, r2_suffix) = F::Packing::pack_slice_with_suffix_mut(r2);
+        let (r3_packed, r3_suffix) = F::Packing::pack_slice_with_suffix_mut(r3);
+
+        for (p0, p1, p2, p3) in izip!(
+            r0_packed.iter_mut(),
+            r1_packed.iter_mut(),
+            r2_packed.iter_mut(),
+            r3_packed.iter_mut()
+        ) {
+            // Layer rev==1.
+            let r2t = *p2 * t1_packed;
+            let r3t = *p3 * t1_packed;
+            let new_r0 = *p0 + r2t;
+            let new_r1 = *p1 + r3t;
+            let new_r2 = *p0 - r2t;
+            let new_r3 = *p1 - r3t;
+
+            // Layer rev==0.
+            let r1t = new_r1 * t0a_packed;
+            let r3t = new_r3 * t0b_packed;
+            *p0 = new_r0 + r1t;
+            *p1 = new_r0 - r1t;
+            *p2 = new_r2 + r3t;
+            *p3 = new_r2 - r3t;
+        }
+
+        for (s0, s1, s2, s3) in izip!(
+            r0_suffix.iter_mut(),
+            r1_suffix.iter_mut(),
+            r2_suffix.iter_mut(),
+            r3_suffix.iter_mut()
+        ) {
+            let r2t = *s2 * t1;
+            let r3t = *s3 * t1;
+            let new_r0 = *s0 + r2t;
+            let new_r1 = *s1 + r3t;
+            let new_r2 = *s0 - r2t;
+            let new_r3 = *s1 - r3t;
+
+            let r1t = new_r1 * t0_a;
+            let r3t = new_r3 * t0_b;
+            *s0 = new_r0 + r1t;
+            *s1 = new_r0 - r1t;
+            *s2 = new_r2 + r3t;
+            *s3 = new_r2 - r3t;
+        }
+    }
+}
+
+/// Fused last two layers for `second_half` (flat bitrev_twiddles layout) with optional scaling.
+///
+/// Used when `scale` hasn't been applied yet at the fused-last-two-layers point (i.e.,
+/// `num_second_half_layers == 2`). The scale is folded into layer_rev==1 so that the
+/// final outputs equal `(butterfly result) * scale`.
+///
+/// When `scale` is `None`, delegates to `dit_layer_rev_last2_flat`.
+/// When `scale` is `Some(s)`:
+///   - Layer rev==1 butterfly output is scaled by `s`:
+///       new_r0 = (r0 + r2*t1) * s = r0*s + r2*(t1*s)
+///       new_r1 = (r1 + r3*t1) * s
+///       new_r2 = (r0 - r2*t1) * s
+///       new_r3 = (r1 - r3*t1) * s
+///   - Layer rev==0 butterfly uses unscaled t0a/t0b since inputs are already scaled:
+///       out0 = new_r0 + new_r1 * t0a
+///       out1 = new_r0 - new_r1 * t0a
+///       etc.
+fn dit_layer_rev_last2_flat_scaled<F: Field>(
+    submat: &mut RowMajorMatrixViewMut<'_, F>,
+    twiddles1: &[F],
+    twiddles0: &[F],
+    scale: Option<F>,
+) {
+    match scale {
+        None => {
+            dit_layer_rev_last2_flat(submat, twiddles1, twiddles0);
+        }
+        Some(s) => {
+            let width = submat.width();
+            let s_packed = F::Packing::from(s);
+
+            for (quad, (&t1, t0_pair)) in submat
+                .values
+                .chunks_mut(4 * width)
+                .zip(twiddles1.iter().zip(twiddles0.chunks(2)))
+            {
+                let t0_a = t0_pair[0];
+                let t0_b = t0_pair[1];
+
+                let (r0, rest) = quad.split_at_mut(width);
+                let (r1, rest) = rest.split_at_mut(width);
+                let (r2, r3) = rest.split_at_mut(width);
+
+                // Precompute t1*s to fold scaling into layer_rev==1.
+                let t1s = t1 * s;
+                let t1s_packed = F::Packing::from(t1s);
+                let t0a_packed = F::Packing::from(t0_a);
+                let t0b_packed = F::Packing::from(t0_b);
+
+                let (r0_packed, r0_suffix) = F::Packing::pack_slice_with_suffix_mut(r0);
+                let (r1_packed, r1_suffix) = F::Packing::pack_slice_with_suffix_mut(r1);
+                let (r2_packed, r2_suffix) = F::Packing::pack_slice_with_suffix_mut(r2);
+                let (r3_packed, r3_suffix) = F::Packing::pack_slice_with_suffix_mut(r3);
+
+                for (p0, p1, p2, p3) in izip!(
+                    r0_packed.iter_mut(),
+                    r1_packed.iter_mut(),
+                    r2_packed.iter_mut(),
+                    r3_packed.iter_mut()
+                ) {
+                    // Layer rev==1 with scale: new_ri = (pi +/- pj*t1) * s
+                    // = pi*s +/- pj*(t1*s)
+                    let p0s = *p0 * s_packed;
+                    let p1s = *p1 * s_packed;
+                    let r2ts = *p2 * t1s_packed;
+                    let r3ts = *p3 * t1s_packed;
+                    let new_r0 = p0s + r2ts;
+                    let new_r1 = p1s + r3ts;
+                    let new_r2 = p0s - r2ts;
+                    let new_r3 = p1s - r3ts;
+
+                    // Layer rev==0: inputs already carry scale, use plain twiddles.
+                    let r1t = new_r1 * t0a_packed;
+                    let r3t = new_r3 * t0b_packed;
+                    *p0 = new_r0 + r1t;
+                    *p1 = new_r0 - r1t;
+                    *p2 = new_r2 + r3t;
+                    *p3 = new_r2 - r3t;
+                }
+
+                for (s0, s1, s2, s3) in izip!(
+                    r0_suffix.iter_mut(),
+                    r1_suffix.iter_mut(),
+                    r2_suffix.iter_mut(),
+                    r3_suffix.iter_mut()
+                ) {
+                    let s0s = *s0 * s;
+                    let s1s = *s1 * s;
+                    let r2ts = *s2 * t1s;
+                    let r3ts = *s3 * t1s;
+                    let new_r0 = s0s + r2ts;
+                    let new_r1 = s1s + r3ts;
+                    let new_r2 = s0s - r2ts;
+                    let new_r3 = s1s - r3ts;
+
+                    let r1t = new_r1 * t0_a;
+                    let r3t = new_r3 * t0_b;
+                    *s0 = new_r0 + r1t;
+                    *s1 = new_r0 - r1t;
+                    *s2 = new_r2 + r3t;
+                    *s3 = new_r2 - r3t;
+                }
+            }
         }
     }
 }
