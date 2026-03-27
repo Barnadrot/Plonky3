@@ -469,6 +469,9 @@ fn second_half<F: Field>(
 
 /// Like `second_half`, except supporting different twiddle factors per layer, enabling coset shifts
 /// to be baked into them.
+///
+/// Fuses the last two layers (layer_rev == 1 and layer_rev == 0) into a single 4-row pass
+/// when both layers are present, reducing memory traffic for those layers.
 #[instrument(level = "debug", skip_all)]
 fn second_half_general<F: Field>(
     mat: &mut RowMajorMatrixViewMut<'_, F>,
@@ -476,18 +479,37 @@ fn second_half_general<F: Field>(
     twiddles_rev: &[Vec<F>],
 ) {
     let log_h = log2_strict_usize(mat.height());
+    // Determine how many layers the second half has.
+    let num_second_half_layers = log_h - mid;
+
     mat.par_row_chunks_exact_mut(1 << (log_h - mid))
         .enumerate()
         .for_each(|(thread, mut submat)| {
             let mut backwards = false;
-            for layer in mid..log_h {
+            let mut layer = mid;
+            while layer < log_h {
                 let layer_rev = log_h - 1 - layer;
                 let first_block = thread << (layer - mid);
-                if layer_rev == 0 {
+
+                // Fuse the last two layers (layer_rev == 1 and layer_rev == 0) into a single
+                // 4-row pass when both are available. This reads/writes each row only once
+                // instead of twice, halving memory traffic for these two layers.
+                if layer_rev == 1 && num_second_half_layers >= 2 {
+                    // layer_rev == 1 is this layer; layer_rev == 0 is the next layer.
+                    // Fuse them: process 4 rows at a time.
+                    dit_layer_rev_last2(
+                        &mut submat,
+                        &twiddles_rev[1][first_block..],
+                        &twiddles_rev[0][first_block * 2..],
+                    );
+                    // We consumed two layers; skip the next layer (layer_rev == 0).
+                    layer += 2;
+                    // backwards would have toggled twice, so it ends up the same.
+                    // No change to backwards needed.
+                    continue;
+                } else if layer_rev == 0 {
                     // Last layer: half_block_size=1, each block is 2 rows.
                     // Use a specialized flat loop to reduce per-block overhead.
-                    // Since blocks are independent, backwards flag only affects processing
-                    // order, not correctness; we always iterate forward for simplicity.
                     dit_layer_rev_last(
                         &mut submat,
                         &twiddles_rev[0][first_block..],
@@ -502,6 +524,7 @@ fn second_half_general<F: Field>(
                     );
                 }
                 backwards = !backwards;
+                layer += 1;
             }
         });
 }
@@ -839,6 +862,116 @@ fn dit_layer_rev_last<F: Field>(
             let new_lo = *ls + x2t;
             *hs = *ls - x2t;
             *ls = new_lo;
+        }
+    }
+}
+
+/// Fused last two layers of the second half: processes layer_rev==1 and layer_rev==0 together.
+///
+/// Each "mega-block" is 4 rows: [r0, r1, r2, r3].
+/// Layer rev==1 butterfly (half_block_size=2):
+///   - block 0: twiddle1_0 applied to (r0, r2)
+///   - block 1: twiddle1_1 applied to (r1, r3)
+/// Layer rev==0 butterfly (half_block_size=1):
+///   - block 0: twiddle0_0 applied to (r0, r1)
+///   - block 1: twiddle0_1 applied to (r2, r3)
+///
+/// By processing both layers in a single pass over memory, each row is loaded and stored
+/// only once instead of twice, halving memory bandwidth for these two layers.
+///
+/// `twiddles1` provides twiddles for layer_rev==1 (2 per mega-block, but each block of 4 rows
+/// has 1 twiddle for layer_rev==1 per half-block, giving 2 twiddles per 4-row group... wait,
+/// actually: for layer_rev==1, block_size=4, half_block_size=2, so there's 1 twiddle per
+/// 4-row block). For layer_rev==0, half_block_size=1, block_size=2, so 2 twiddles per 4-row group.
+///
+/// Concretely for a 4-row mega-block with rows [r0, r1, r2, r3]:
+///   Layer rev==1 (block_size=4, half_block_size=2, 1 twiddle per 4-row):
+///     Apply twiddle `t1` to the pair (lo=[r0,r1], hi=[r2,r3]):
+///       r0' = r0 + r2*t1,  r2' = r0 - r2*t1
+///       r1' = r1 + r3*t1,  r1' = r1 - r3*t1  (same t1 for all row-pairs in the block)
+///   Layer rev==0 (block_size=2, half_block_size=1, 2 twiddles per 4-row group):
+///     Apply twiddle `t0_a` to pair (r0', r1'):
+///       out0 = r0' + r1'*t0_a,  out1 = r0' - r1'*t0_a
+///     Apply twiddle `t0_b` to pair (r2', r3'):
+///       out2 = r2' + r3'*t0_b,  out3 = r2' - r3'*t0_b
+fn dit_layer_rev_last2<F: Field>(
+    submat: &mut RowMajorMatrixViewMut<'_, F>,
+    twiddles1: &[F],  // layer_rev==1 twiddles: 1 per 4-row block
+    twiddles0: &[F],  // layer_rev==0 twiddles: 2 per 4-row block (interleaved pairs)
+) {
+    let width = submat.width();
+    // Each mega-block is 4 rows = 4*width elements.
+    // twiddles1: 1 entry per mega-block
+    // twiddles0: 2 entries per mega-block (for the two 2-row sub-blocks after the first layer)
+    for (quad, (&t1, t0_pair)) in submat
+        .values
+        .chunks_mut(4 * width)
+        .zip(twiddles1.iter().zip(twiddles0.chunks(2)))
+    {
+        let t0_a = t0_pair[0];
+        let t0_b = t0_pair[1];
+
+        // Split the 4-row block into 4 individual rows.
+        let (r0, rest) = quad.split_at_mut(width);
+        let (r1, rest) = rest.split_at_mut(width);
+        let (r2, r3) = rest.split_at_mut(width);
+
+        // Pre-broadcast twiddles into packed fields.
+        let t1_packed = F::Packing::from(t1);
+        let t0a_packed = F::Packing::from(t0_a);
+        let t0b_packed = F::Packing::from(t0_b);
+
+        // Process packed chunks.
+        let (r0_packed, r0_suffix) = F::Packing::pack_slice_with_suffix_mut(r0);
+        let (r1_packed, r1_suffix) = F::Packing::pack_slice_with_suffix_mut(r1);
+        let (r2_packed, r2_suffix) = F::Packing::pack_slice_with_suffix_mut(r2);
+        let (r3_packed, r3_suffix) = F::Packing::pack_slice_with_suffix_mut(r3);
+
+        for (p0, p1, p2, p3) in izip!(
+            r0_packed.iter_mut(),
+            r1_packed.iter_mut(),
+            r2_packed.iter_mut(),
+            r3_packed.iter_mut()
+        ) {
+            // Layer rev==1: apply t1 to (r0,r2) and to (r1,r3) simultaneously.
+            let r2t = *p2 * t1_packed;
+            let r3t = *p3 * t1_packed;
+            let new_r0 = *p0 + r2t;
+            let new_r1 = *p1 + r3t;
+            let new_r2 = *p0 - r2t;
+            let new_r3 = *p1 - r3t;
+
+            // Layer rev==0: apply t0_a to (new_r0, new_r1), t0_b to (new_r2, new_r3).
+            let r1t = new_r1 * t0a_packed;
+            let r3t = new_r3 * t0b_packed;
+            *p0 = new_r0 + r1t;
+            *p1 = new_r0 - r1t;
+            *p2 = new_r2 + r3t;
+            *p3 = new_r2 - r3t;
+        }
+
+        // Scalar suffix.
+        for (s0, s1, s2, s3) in izip!(
+            r0_suffix.iter_mut(),
+            r1_suffix.iter_mut(),
+            r2_suffix.iter_mut(),
+            r3_suffix.iter_mut()
+        ) {
+            // Layer rev==1.
+            let r2t = *s2 * t1;
+            let r3t = *s3 * t1;
+            let new_r0 = *s0 + r2t;
+            let new_r1 = *s1 + r3t;
+            let new_r2 = *s0 - r2t;
+            let new_r3 = *s1 - r3t;
+
+            // Layer rev==0.
+            let r1t = new_r1 * t0_a;
+            let r3t = new_r3 * t0_b;
+            *s0 = new_r0 + r1t;
+            *s1 = new_r0 - r1t;
+            *s2 = new_r2 + r3t;
+            *s3 = new_r2 - r3t;
         }
     }
 }
