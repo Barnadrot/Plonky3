@@ -332,6 +332,10 @@ fn first_half<F: Field>(mat: &mut RowMajorMatrix<F>, mid: usize, twiddles: &[F])
 
 /// Like `first_half`, except supporting different twiddle factors per layer, enabling coset shifts
 /// to be baked into them.
+///
+/// For layer 0, all blocks in the entire matrix share the same twiddle `twiddles[layer_rev][0]`
+/// (the coset shift). We pre-broadcast it once and use a flat packed loop, avoiding per-block
+/// iterator cloning overhead.
 #[instrument(level = "debug", skip_all)]
 fn first_half_general<F: Field>(
     mat: &mut RowMajorMatrixViewMut<'_, F>,
@@ -344,7 +348,16 @@ fn first_half_general<F: Field>(
             let mut backwards = false;
             for layer in 0..mid {
                 let layer_rev = log_h - 1 - layer;
-                dit_layer(&mut submat, layer, twiddles[layer_rev].iter(), backwards);
+                if layer == 0 {
+                    // Layer 0: half_block_size=1. All blocks in this submat use the same
+                    // twiddle twiddles[layer_rev][0], since in the bit-reversed twiddle layout
+                    // for layer_rev >= mid, each parallel chunk shares one twiddle at position 0.
+                    // We pass this single twiddle directly to avoid iterator cloning overhead.
+                    let twiddle = twiddles[layer_rev][0];
+                    dit_layer_uniform_twiddle(&mut submat, twiddle, backwards);
+                } else {
+                    dit_layer(&mut submat, layer, twiddles[layer_rev].iter(), backwards);
+                }
                 backwards = !backwards;
             }
         });
@@ -573,6 +586,54 @@ fn dit_layer_first_one<'a, F: Field>(
     } else {
         for block in blocks {
             process_block(block);
+        }
+    }
+}
+
+/// One layer of a DIT butterfly network where all blocks share a single uniform twiddle factor.
+///
+/// This is used in `first_half_general` for layer 0. At layer 0, the twiddle layout ensures
+/// that all `h/2` blocks (each a row-pair) use the same twiddle value `twiddles[layer_rev][0]`.
+/// By pre-broadcasting this single twiddle into a packed field once and then processing all
+/// row-pairs in a flat loop, we eliminate the per-block iterator-clone overhead of `dit_layer`.
+///
+/// Correctness: Only valid when all blocks at this layer share the same twiddle (layer 0).
+fn dit_layer_uniform_twiddle<F: Field>(
+    submat: &mut RowMajorMatrixViewMut<'_, F>,
+    twiddle: F,
+    backwards: bool,
+) {
+    let width = submat.width();
+    // Pre-broadcast the scalar twiddle into a packed field once for all blocks.
+    let twiddle_packed = F::Packing::from(twiddle);
+
+    let process_pair = |pair: &mut [F]| {
+        let (lo, hi) = pair.split_at_mut(width);
+        let (lo_packed, lo_suffix) = F::Packing::pack_slice_with_suffix_mut(lo);
+        let (hi_packed, hi_suffix) = F::Packing::pack_slice_with_suffix_mut(hi);
+        for (lp, hp) in lo_packed.iter_mut().zip(hi_packed.iter_mut()) {
+            let x2t = *hp * twiddle_packed;
+            let new_lo = *lp + x2t;
+            *hp = *lp - x2t;
+            *lp = new_lo;
+        }
+        for (ls, hs) in lo_suffix.iter_mut().zip(hi_suffix.iter_mut()) {
+            let x2t = *hs * twiddle;
+            let new_lo = *ls + x2t;
+            *hs = *ls - x2t;
+            *ls = new_lo;
+        }
+    };
+
+    // Each block is 2 rows = 2*width elements.
+    let blocks = submat.values.chunks_mut(2 * width);
+    if backwards {
+        for pair in blocks.rev() {
+            process_pair(pair);
+        }
+    } else {
+        for pair in blocks {
+            process_pair(pair);
         }
     }
 }
