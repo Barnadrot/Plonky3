@@ -919,38 +919,28 @@ fn dit_layer_rev_last<F: Field>(
 /// By processing both layers in a single pass over memory, each row is loaded and stored
 /// only once instead of twice, halving memory bandwidth for these two layers.
 ///
-/// `twiddles1` provides twiddles for layer_rev==1 (2 per mega-block, but each block of 4 rows
-/// has 1 twiddle for layer_rev==1 per half-block, giving 2 twiddles per 4-row group... wait,
-/// actually: for layer_rev==1, block_size=4, half_block_size=2, so there's 1 twiddle per
-/// 4-row block). For layer_rev==0, half_block_size=1, block_size=2, so 2 twiddles per 4-row group.
-///
-/// Concretely for a 4-row mega-block with rows [r0, r1, r2, r3]:
-///   Layer rev==1 (block_size=4, half_block_size=2, 1 twiddle per 4-row):
-///     Apply twiddle `t1` to the pair (lo=[r0,r1], hi=[r2,r3]):
-///       r0' = r0 + r2*t1,  r2' = r0 - r2*t1
-///       r1' = r1 + r3*t1,  r1' = r1 - r3*t1  (same t1 for all row-pairs in the block)
-///   Layer rev==0 (block_size=2, half_block_size=1, 2 twiddles per 4-row group):
-///     Apply twiddle `t0_a` to pair (r0', r1'):
-///       out0 = r0' + r1'*t0_a,  out1 = r0' - r1'*t0_a
-///     Apply twiddle `t0_b` to pair (r2', r3'):
-///       out2 = r2' + r3'*t0_b,  out3 = r2' - r3'*t0_b
+/// `twiddles1` provides twiddles for layer_rev==1 (1 twiddle per 4-row mega-block).
+/// `twiddles0` provides twiddles for layer_rev==0 (2 twiddles per 4-row mega-block,
+/// stored at even/odd positions: twiddles0[2*i] and twiddles0[2*i+1]).
 fn dit_layer_rev_last2<F: Field>(
     submat: &mut RowMajorMatrixViewMut<'_, F>,
     twiddles1: &[F],  // layer_rev==1 twiddles: 1 per 4-row block
-    twiddles0: &[F],  // layer_rev==0 twiddles: 2 per 4-row block (interleaved pairs)
+    twiddles0: &[F],  // layer_rev==0 twiddles: 2 per 4-row block (at even/odd positions)
 ) {
     let width = submat.width();
     // Each mega-block is 4 rows = 4*width elements.
     // twiddles1: 1 entry per mega-block
-    // twiddles0: 2 entries per mega-block (for the two 2-row sub-blocks after the first layer)
-    for (quad, (&t1, t0_pair)) in submat
+    // twiddles0: 2 entries per mega-block, accessed via two stepped iterators
+    //
+    // Use two step_by(2) iterators over twiddles0 to avoid the Chunks iterator overhead
+    // and bounds-checked slice indexing (t0_pair[0], t0_pair[1]).
+    let twiddles0_even = twiddles0.iter().step_by(2);
+    let twiddles0_odd = twiddles0[1..].iter().step_by(2);
+    for (quad, (&t1, (&t0_a, &t0_b))) in submat
         .values
         .chunks_mut(4 * width)
-        .zip(twiddles1.iter().zip(twiddles0.chunks(2)))
+        .zip(twiddles1.iter().zip(twiddles0_even.zip(twiddles0_odd)))
     {
-        let t0_a = t0_pair[0];
-        let t0_b = t0_pair[1];
-
         // Split the 4-row block into 4 individual rows.
         let (r0, rest) = quad.split_at_mut(width);
         let (r1, rest) = rest.split_at_mut(width);
@@ -1029,14 +1019,15 @@ fn dit_layer_rev_last2_flat<F: Field>(
     twiddles0: &[F],
 ) {
     let width = submat.width();
-    for (quad, (&t1, t0_pair)) in submat
+    // Use two step_by(2) iterators over twiddles0 to avoid Chunks iterator overhead
+    // and bounds-checked indexing (t0_pair[0], t0_pair[1]).
+    let twiddles0_even = twiddles0.iter().step_by(2);
+    let twiddles0_odd = twiddles0[1..].iter().step_by(2);
+    for (quad, (&t1, (&t0_a, &t0_b))) in submat
         .values
         .chunks_mut(4 * width)
-        .zip(twiddles1.iter().zip(twiddles0.chunks(2)))
+        .zip(twiddles1.iter().zip(twiddles0_even.zip(twiddles0_odd)))
     {
-        let t0_a = t0_pair[0];
-        let t0_b = t0_pair[1];
-
         let (r0, rest) = quad.split_at_mut(width);
         let (r1, rest) = rest.split_at_mut(width);
         let (r2, r3) = rest.split_at_mut(width);
@@ -1127,14 +1118,15 @@ fn dit_layer_rev_last2_flat_scaled<F: Field>(
             let width = submat.width();
             let s_packed = F::Packing::from(s);
 
-            for (quad, (&t1, t0_pair)) in submat
+            // Use two step_by(2) iterators over twiddles0 to avoid Chunks iterator overhead
+            // and bounds-checked indexing (t0_pair[0], t0_pair[1]).
+            let twiddles0_even = twiddles0.iter().step_by(2);
+            let twiddles0_odd = twiddles0[1..].iter().step_by(2);
+            for (quad, (&t1, (&t0_a, &t0_b))) in submat
                 .values
                 .chunks_mut(4 * width)
-                .zip(twiddles1.iter().zip(twiddles0.chunks(2)))
+                .zip(twiddles1.iter().zip(twiddles0_even.zip(twiddles0_odd)))
             {
-                let t0_a = t0_pair[0];
-                let t0_b = t0_pair[1];
-
                 let (r0, rest) = quad.split_at_mut(width);
                 let (r1, rest) = rest.split_at_mut(width);
                 let (r2, r3) = rest.split_at_mut(width);
