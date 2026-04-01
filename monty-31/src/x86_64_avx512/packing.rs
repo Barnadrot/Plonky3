@@ -20,7 +20,6 @@ use p3_field::op_assign_macros::{
 use p3_field::{
     Algebra, Field, InjectiveMonomial, PackedField, PackedFieldPow2, PackedValue,
     PermutationMonomial, PrimeCharacteristicRing, impl_packed_field_pow_2, mm512_mod_add,
-    mm512_mod_sub,
 };
 use p3_util::reconstitute_from_base;
 use rand::distr::{Distribution, StandardUniform};
@@ -114,9 +113,25 @@ impl<PMP: PackedMontyParameters> Add for PackedMontyField31AVX512<PMP> {
     fn add(self, rhs: Self) -> Self {
         let lhs = self.to_vector();
         let rhs = rhs.to_vector();
-        let res = mm512_mod_add(lhs, rhs, PMP::PACKED_P);
+        // Use compare+mask instead of vpminud to reduce port 0 pressure.
+        // The vpminud in mm512_mod_add runs on port 0, which is under heavy pressure
+        // from the vpmuludq instructions in the butterfly multiply operations.
+        // Using vpcmpge_epu32_mask (port 5 only) + vpsubd{k} (port 0+5) reduces port 0 usage.
+        //
+        // Compiles to:
+        //   vpaddd   t, lhs, rhs
+        //   vpcmpud  k, t, P, ≥    (port 5 only)
+        //   vpsubd   t{k}, t, P    (port 0+5, masked subtract)
+        // throughput: 3 ops (same as mm512_mod_add), but shifts vpminud port-0 usage to port-5
+        let res = unsafe {
+            let t = x86_64::_mm512_add_epi32(lhs, rhs);
+            // k = 1 where t >= P (sum exceeded P, subtract P to get canonical form)
+            let k = x86_64::_mm512_cmpge_epu32_mask(t, PMP::PACKED_P);
+            // Subtract P from those lanes that overflowed
+            x86_64::_mm512_mask_sub_epi32(t, k, t, PMP::PACKED_P)
+        };
         unsafe {
-            // Safety: `add` returns values in canonical form when given values in canonical form.
+            // Safety: result is in canonical form [0, P) when inputs are in canonical form.
             Self::from_vector(res)
         }
     }
@@ -128,9 +143,29 @@ impl<PMP: PackedMontyParameters> Sub for PackedMontyField31AVX512<PMP> {
     fn sub(self, rhs: Self) -> Self {
         let lhs = self.to_vector();
         let rhs = rhs.to_vector();
-        let res = mm512_mod_sub(lhs, rhs, PMP::PACKED_P);
+        // Use compare+mask instead of vpminud to reduce port 0 pressure.
+        // The vpminud in mm512_mod_sub runs on port 0, which is under heavy pressure
+        // from the vpmuludq instructions in the butterfly multiply operations.
+        // Using vpcmpge_epu32_mask (port 5 only) + vpaddd{k} (port 0+5) reduces port 0 usage.
+        //
+        // When lhs >= rhs: t = lhs - rhs ∈ [0, P-1] < P, so k=0, result = t. ✓
+        // When lhs < rhs: t wraps to [2^32-P+1, 2^32-1] ≥ P, so k=1,
+        //   result = t + P mod 2^32 = P - (rhs-lhs) ∈ [1, P-1]. ✓
+        //
+        // Compiles to:
+        //   vpsubd   t, lhs, rhs
+        //   vpcmpud  k, t, P, ≥    (port 5 only)
+        //   vpaddd   t{k}, t, P    (port 0+5, masked add)
+        // throughput: 3 ops (same as mm512_mod_sub), but shifts vpminud port-0 usage to port-5
+        let res = unsafe {
+            let t = x86_64::_mm512_sub_epi32(lhs, rhs);
+            // k = 1 where t >= P (subtraction wrapped, add P to get canonical form)
+            let k = x86_64::_mm512_cmpge_epu32_mask(t, PMP::PACKED_P);
+            // Add P to those lanes that underflowed (wrapped around)
+            x86_64::_mm512_mask_add_epi32(t, k, t, PMP::PACKED_P)
+        };
         unsafe {
-            // Safety: `mm512_mod_sub` returns values in canonical form when given values in canonical form.
+            // Safety: result is in canonical form [0, P) when inputs are in canonical form.
             Self::from_vector(res)
         }
     }
