@@ -512,6 +512,11 @@ fn second_half<F: Field>(
 ///
 /// Fuses the last two layers (layer_rev == 1 and layer_rev == 0) into a single 4-row pass
 /// when both layers are present, reducing memory traffic for those layers.
+///
+/// All general layers are processed with forward (non-reversed) iteration order, since each
+/// block is independent and correctness does not depend on processing order. This eliminates
+/// the alternating `backwards` flag and always uses sequential memory access for better
+/// hardware prefetcher utilization.
 #[instrument(level = "debug", skip_all)]
 fn second_half_general<F: Field>(
     mat: &mut RowMajorMatrixViewMut<'_, F>,
@@ -525,7 +530,6 @@ fn second_half_general<F: Field>(
     mat.par_row_chunks_exact_mut(1 << (log_h - mid))
         .enumerate()
         .for_each(|(thread, mut submat)| {
-            let mut backwards = false;
             let mut layer = mid;
             while layer < log_h {
                 let layer_rev = log_h - 1 - layer;
@@ -544,8 +548,6 @@ fn second_half_general<F: Field>(
                     );
                     // We consumed two layers; skip the next layer (layer_rev == 0).
                     layer += 2;
-                    // backwards would have toggled twice, so it ends up the same.
-                    // No change to backwards needed.
                     continue;
                 } else if layer_rev == 0 {
                     // Last layer: half_block_size=1, each block is 2 rows.
@@ -555,15 +557,17 @@ fn second_half_general<F: Field>(
                         &twiddles_rev[0][first_block..],
                     );
                 } else {
+                    // Always iterate forward (backwards=false): each block is independent
+                    // so processing order doesn't affect correctness, and forward access
+                    // gives the best sequential prefetch behavior.
                     dit_layer_rev(
                         &mut submat,
                         log_h,
                         layer,
                         twiddles_rev[layer_rev][first_block..].iter().copied(),
-                        backwards,
+                        false,
                     );
                 }
-                backwards = !backwards;
                 layer += 1;
             }
         });
