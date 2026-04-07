@@ -20,7 +20,6 @@ use p3_field::op_assign_macros::{
 use p3_field::{
     Algebra, Field, InjectiveMonomial, PackedField, PackedFieldPow2, PackedValue,
     PermutationMonomial, PrimeCharacteristicRing, impl_packed_field_pow_2, mm512_mod_add,
-    mm512_mod_sub,
 };
 use p3_util::reconstitute_from_base;
 use rand::distr::{Distribution, StandardUniform};
@@ -114,9 +113,25 @@ impl<PMP: PackedMontyParameters> Add for PackedMontyField31AVX512<PMP> {
     fn add(self, rhs: Self) -> Self {
         let lhs = self.to_vector();
         let rhs = rhs.to_vector();
-        let res = mm512_mod_add(lhs, rhs, PMP::PACKED_P);
+        // We want this to compile to:
+        //     vpaddd   t, lhs, rhs
+        //     vpcmpge  overflow, t, P     (unsigned compare on port 5, not port 0)
+        //     vpsubd   res{overflow}, t, P
+        // throughput: 1 cyc/vec (16 els/cyc)
+        // latency: 3 cyc
+        //
+        // This avoids `vpminud` which runs exclusively on port 0, which is already under
+        // pressure from Montgomery multiplications. Using `vpcmpge_epu32_mask` on port 5
+        // and `mask_vpsubd` on port 0/1/5 frees port 0 for mul throughput.
+        let res = unsafe {
+            // Safety: If this code got compiled then AVX-512F intrinsics are available.
+            let t = x86_64::_mm512_add_epi32(lhs, rhs);
+            // Unsigned compare: t >= P means addition overflowed mod P, need to subtract P.
+            let overflow = x86_64::_mm512_cmpge_epu32_mask(t, PMP::PACKED_P);
+            x86_64::_mm512_mask_sub_epi32(t, overflow, t, PMP::PACKED_P)
+        };
         unsafe {
-            // Safety: `add` returns values in canonical form when given values in canonical form.
+            // Safety: result is in canonical form when inputs are in canonical form.
             Self::from_vector(res)
         }
     }
@@ -128,9 +143,25 @@ impl<PMP: PackedMontyParameters> Sub for PackedMontyField31AVX512<PMP> {
     fn sub(self, rhs: Self) -> Self {
         let lhs = self.to_vector();
         let rhs = rhs.to_vector();
-        let res = mm512_mod_sub(lhs, rhs, PMP::PACKED_P);
+        // We want this to compile to:
+        //     vpsubd   t, lhs, rhs
+        //     vpcmplt  underflow, lhs, rhs    (unsigned compare on port 5, not port 0)
+        //     vpaddd   res{underflow}, t, P
+        // throughput: 1 cyc/vec (16 els/cyc)
+        // latency: 3 cyc
+        //
+        // This avoids `vpminud` which runs exclusively on port 0, which is already under
+        // pressure from Montgomery multiplications. Using `vpcmplt_epu32_mask` on port 5
+        // and `mask_vpaddd` on port 0/1/5 frees port 0 for mul throughput.
+        let res = unsafe {
+            // Safety: If this code got compiled then AVX-512F intrinsics are available.
+            let t = x86_64::_mm512_sub_epi32(lhs, rhs);
+            // Unsigned compare: lhs < rhs means subtraction wrapped around, need to add P.
+            let underflow = x86_64::_mm512_cmplt_epu32_mask(lhs, rhs);
+            x86_64::_mm512_mask_add_epi32(t, underflow, t, PMP::PACKED_P)
+        };
         unsafe {
-            // Safety: `mm512_mod_sub` returns values in canonical form when given values in canonical form.
+            // Safety: result is in canonical form when inputs are in canonical form.
             Self::from_vector(res)
         }
     }
