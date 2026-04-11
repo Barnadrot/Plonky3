@@ -6,7 +6,7 @@ use core::mem::{MaybeUninit, transmute};
 
 use itertools::{Itertools, izip};
 use p3_field::integers::QuotientMap;
-use p3_field::{Field, Powers, TwoAdicField};
+use p3_field::{Field, PackedField, PackedValue, Powers, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::bitrev::{BitReversalPerm, BitReversedMatrixView, BitReversibleMatrix};
 use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView, RowMajorMatrixViewMut};
@@ -340,8 +340,18 @@ fn first_half_general<F: Field>(
     let log_h = log2_strict_usize(mat.height());
     mat.par_row_chunks_exact_mut(1 << mid)
         .for_each(|mut submat| {
-            let mut backwards = false;
-            for layer in 0..mid {
+            let start_layer;
+            if mid >= 2 {
+                // Fuse layers 0 and 1 to save one memory pass.
+                dit_fused_layers_0_1(&mut submat, twiddles, log_h);
+                start_layer = 2;
+            } else {
+                start_layer = 0;
+            }
+            // backwards starts as false; after layer 0 it's true, after layer 1 it's false.
+            // So after the fused pair (layers 0+1), backwards = false.
+            let mut backwards = start_layer % 2 != 0;
+            for layer in start_layer..mid {
                 let layer_rev = log_h - 1 - layer;
                 dit_layer(&mut submat, layer, twiddles[layer_rev].iter(), backwards);
                 backwards = !backwards;
@@ -364,17 +374,22 @@ fn first_half_general_oop<F: Field>(
     src.par_row_chunks_exact(1 << mid)
         .zip(dst_maybe.par_row_chunks_exact_mut(1 << mid))
         .for_each(|(src_submat, mut dst_submat_maybe)| {
-            debug_assert_eq!(src_submat.dimensions(), dst_submat_maybe.dimensions());
-
-            // The first layer is special, done out-of-place.
-            // (Recall from the mid definition that there must be at least one layer here.)
-            let layer_rev = log_h - 1;
-            dit_layer_oop(
-                &src_submat,
-                &mut dst_submat_maybe,
-                0,
-                twiddles[layer_rev].iter(),
-            );
+            let start_layer;
+            if mid >= 2 {
+                // Fuse layers 0 and 1 out-of-place to save one memory pass.
+                dit_fused_layers_0_1_oop(&src_submat, &mut dst_submat_maybe, twiddles, log_h);
+                start_layer = 2;
+            } else {
+                // The first layer is special, done out-of-place.
+                let layer_rev = log_h - 1;
+                dit_layer_oop(
+                    &src_submat,
+                    &mut dst_submat_maybe,
+                    0,
+                    twiddles[layer_rev].iter(),
+                );
+                start_layer = 1;
+            }
 
             // submat is now initialized.
             let mut dst_submat = unsafe {
@@ -384,8 +399,9 @@ fn first_half_general_oop<F: Field>(
             };
 
             // Subsequent layers.
-            let mut backwards = true;
-            for layer in 1..mid {
+            // backwards starts as false; after layer 0 it's true, after layer 1 it's false.
+            let mut backwards = start_layer % 2 != 0;
+            for layer in start_layer..mid {
                 let layer_rev = log_h - 1 - layer;
                 dit_layer(
                     &mut dst_submat,
@@ -492,6 +508,161 @@ fn second_half_general<F: Field>(
                 backwards = !backwards;
             }
         });
+}
+
+/// Fuse layers 0 and 1 of a DIT butterfly network into a single memory pass.
+///
+/// Instead of two separate passes over the data (one for layer 0, one for layer 1),
+/// this processes groups of 4 consecutive rows, applying both butterfly layers in
+/// registers before writing back. This halves the memory traffic for these two layers.
+///
+/// For layer 0: half_block_size=1, block_size=2, single twiddle t0.
+/// For layer 1: half_block_size=2, block_size=4, twiddles t1_0, t1_1.
+///
+/// For each group of 4 rows (r0, r1, r2, r3):
+///   Layer 0: a = r0 + t0*r1, b = r0 - t0*r1, c = r2 + t0*r3, d = r2 - t0*r3
+///   Layer 1: out0 = a + t1_0*c, out2 = a - t1_0*c, out1 = b + t1_1*d, out3 = b - t1_1*d
+fn dit_fused_layers_0_1<F: Field>(
+    submat: &mut RowMajorMatrixViewMut<'_, F>,
+    twiddles: &[Vec<F>],
+    log_h: usize,
+) {
+    let width = submat.width();
+    // Layer 0: twiddles[log_h-1] has 1 element (the single twiddle for all 2-row blocks)
+    let t0 = twiddles[log_h - 1][0];
+    // Layer 1: twiddles[log_h-2] has 2 elements (twiddles for half_block_size=2 blocks)
+    let t1_0 = twiddles[log_h - 2][0];
+    let t1_1 = twiddles[log_h - 2][1];
+
+    // Pre-broadcast twiddles into packed fields to avoid per-iteration broadcasts.
+    let t0_packed = F::Packing::from(t0);
+    let t1_0_packed = F::Packing::from(t1_0);
+    let t1_1_packed = F::Packing::from(t1_1);
+
+    // Process groups of 4 rows at a time.
+    for group in submat.values.chunks_mut(4 * width) {
+        let (r01, r23) = group.split_at_mut(2 * width);
+        let (r0_row, r1_row) = r01.split_at_mut(width);
+        let (r2_row, r3_row) = r23.split_at_mut(width);
+
+        // Process packed elements.
+        let (r0_shorts, r0_suffix) = F::Packing::pack_slice_with_suffix_mut(r0_row);
+        let (r1_shorts, r1_suffix) = F::Packing::pack_slice_with_suffix_mut(r1_row);
+        let (r2_shorts, r2_suffix) = F::Packing::pack_slice_with_suffix_mut(r2_row);
+        let (r3_shorts, r3_suffix) = F::Packing::pack_slice_with_suffix_mut(r3_row);
+
+        for (r0, r1, r2, r3) in izip!(r0_shorts.iter_mut(), r1_shorts.iter_mut(), r2_shorts.iter_mut(), r3_shorts.iter_mut()) {
+            // Layer 0: butterfly on (r0,r1) and (r2,r3) with twiddle t0
+            let t0_r1 = *r1 * t0_packed;
+            let a = *r0 + t0_r1;
+            let b = *r0 - t0_r1;
+            let t0_r3 = *r3 * t0_packed;
+            let c = *r2 + t0_r3;
+            let d = *r2 - t0_r3;
+            // Layer 1: butterfly on (a,c) with t1_0 and (b,d) with t1_1
+            let t1_0_c = c * t1_0_packed;
+            let t1_1_d = d * t1_1_packed;
+            *r0 = a + t1_0_c;
+            *r2 = a - t1_0_c;
+            *r1 = b + t1_1_d;
+            *r3 = b - t1_1_d;
+        }
+
+        // Handle suffix (non-packed remainder).
+        for (r0, r1, r2, r3) in izip!(r0_suffix.iter_mut(), r1_suffix.iter_mut(), r2_suffix.iter_mut(), r3_suffix.iter_mut()) {
+            let t0_r1 = *r1 * t0;
+            let a = *r0 + t0_r1;
+            let b = *r0 - t0_r1;
+            let t0_r3 = *r3 * t0;
+            let c = *r2 + t0_r3;
+            let d = *r2 - t0_r3;
+            let t1_0_c = c * t1_0;
+            let t1_1_d = d * t1_1;
+            *r0 = a + t1_0_c;
+            *r2 = a - t1_0_c;
+            *r1 = b + t1_1_d;
+            *r3 = b - t1_1_d;
+        }
+    }
+}
+
+/// Like `dit_fused_layers_0_1`, except out-of-place: reads from `src`, writes to `dst`.
+///
+/// This combines the first OOP layer and the second in-place layer into a single pass.
+fn dit_fused_layers_0_1_oop<F: Field>(
+    src: &RowMajorMatrixView<'_, F>,
+    dst: &mut RowMajorMatrixViewMut<'_, MaybeUninit<F>>,
+    twiddles: &[Vec<F>],
+    log_h: usize,
+) {
+    let width = src.width();
+    let t0 = twiddles[log_h - 1][0];
+    let t1_0 = twiddles[log_h - 2][0];
+    let t1_1 = twiddles[log_h - 2][1];
+
+    let t0_packed = F::Packing::from(t0);
+    let t1_0_packed = F::Packing::from(t1_0);
+    let t1_1_packed = F::Packing::from(t1_1);
+
+    for (src_group, dst_group) in src.values.chunks(4 * width).zip(dst.values.chunks_mut(4 * width)) {
+        let (s01, s23) = src_group.split_at(2 * width);
+        let (s0_row, s1_row) = s01.split_at(width);
+        let (s2_row, s3_row) = s23.split_at(width);
+
+        // SAFETY: dst_group has the same layout as 4 rows of MaybeUninit<F>.
+        // We'll write all elements before returning.
+        let dst_f = unsafe {
+            core::slice::from_raw_parts_mut(dst_group.as_mut_ptr() as *mut F, dst_group.len())
+        };
+        let (d01, d23) = dst_f.split_at_mut(2 * width);
+        let (d0_row, d1_row) = d01.split_at_mut(width);
+        let (d2_row, d3_row) = d23.split_at_mut(width);
+
+        let (s0_shorts, s0_suffix) = F::Packing::pack_slice_with_suffix(s0_row);
+        let (s1_shorts, s1_suffix) = F::Packing::pack_slice_with_suffix(s1_row);
+        let (s2_shorts, s2_suffix) = F::Packing::pack_slice_with_suffix(s2_row);
+        let (s3_shorts, s3_suffix) = F::Packing::pack_slice_with_suffix(s3_row);
+        let (d0_shorts, d0_suffix) = F::Packing::pack_slice_with_suffix_mut(d0_row);
+        let (d1_shorts, d1_suffix) = F::Packing::pack_slice_with_suffix_mut(d1_row);
+        let (d2_shorts, d2_suffix) = F::Packing::pack_slice_with_suffix_mut(d2_row);
+        let (d3_shorts, d3_suffix) = F::Packing::pack_slice_with_suffix_mut(d3_row);
+
+        for (s0, s1, s2, s3, d0, d1, d2, d3) in izip!(
+            s0_shorts, s1_shorts, s2_shorts, s3_shorts,
+            d0_shorts.iter_mut(), d1_shorts.iter_mut(), d2_shorts.iter_mut(), d3_shorts.iter_mut()
+        ) {
+            let t0_s1 = *s1 * t0_packed;
+            let a = *s0 + t0_s1;
+            let b = *s0 - t0_s1;
+            let t0_s3 = *s3 * t0_packed;
+            let c = *s2 + t0_s3;
+            let d_val = *s2 - t0_s3;
+            let t1_0_c = c * t1_0_packed;
+            let t1_1_d = d_val * t1_1_packed;
+            *d0 = a + t1_0_c;
+            *d2 = a - t1_0_c;
+            *d1 = b + t1_1_d;
+            *d3 = b - t1_1_d;
+        }
+
+        for (s0, s1, s2, s3, d0, d1, d2, d3) in izip!(
+            s0_suffix, s1_suffix, s2_suffix, s3_suffix,
+            d0_suffix.iter_mut(), d1_suffix.iter_mut(), d2_suffix.iter_mut(), d3_suffix.iter_mut()
+        ) {
+            let t0_s1 = *s1 * t0;
+            let a = *s0 + t0_s1;
+            let b = *s0 - t0_s1;
+            let t0_s3 = *s3 * t0;
+            let c = *s2 + t0_s3;
+            let d_val = *s2 - t0_s3;
+            let t1_0_c = c * t1_0;
+            let t1_1_d = d_val * t1_1;
+            *d0 = a + t1_0_c;
+            *d2 = a - t1_0_c;
+            *d1 = b + t1_1_d;
+            *d3 = b - t1_1_d;
+        }
+    }
 }
 
 /// One layer of a DIT butterfly network where all twiddle factors are 1 (i.e., layer 0).
