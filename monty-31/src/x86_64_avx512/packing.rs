@@ -555,16 +555,21 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         let prod_evn = x86_64::_mm512_mul_epu32(lhs_evn, rhs_evn);
         let prod_odd = x86_64::_mm512_mul_epu32(lhs_odd, rhs_odd);
 
-        // CIOS-style reordering: compute q_odd/q_p_odd chain before q_evn/q_p_evn so the odd
-        // chain feeds `mask_movehdup_epi32(q_p_odd, EVENS, q_p_evn)` sooner (odd operand is
-        // the primary source; even operand arrives under the EVENS mask).
-        let q_odd = confuse_compiler(x86_64::_mm512_mul_epu32(prod_odd, MPAVX512::PACKED_MU));
+        // We throw a confuse compiler here to prevent the compiler from
+        // using vpmullq instead of vpmuludq in the computations for q_p.
+        // vpmullq has both higher latency and lower throughput.
         let q_evn = confuse_compiler(x86_64::_mm512_mul_epu32(prod_evn, MPAVX512::PACKED_MU));
+        let q_odd = confuse_compiler(x86_64::_mm512_mul_epu32(prod_odd, MPAVX512::PACKED_MU));
 
+        // Get all the high halves as one vector: this is `(lhs * rhs) >> 32`.
+        // NB: `vpermt2d` may feel like a more intuitive choice here, but it has much higher
+        // latency.
         let prod_hi = mask_movehdup_epi32(prod_odd, EVENS, prod_evn);
 
-        let q_p_odd = x86_64::_mm512_mul_epu32(q_odd, MPAVX512::PACKED_P);
+        // Normally we'd want to mask to perform % 2**32, but the instruction below only reads the
+        // low 32 bits anyway.
         let q_p_evn = x86_64::_mm512_mul_epu32(q_evn, MPAVX512::PACKED_P);
+        let q_p_odd = x86_64::_mm512_mul_epu32(q_odd, MPAVX512::PACKED_P);
 
         // We can ignore all the low halves of `q_p` as they cancel out. Get all the high halves as
         // one vector.
