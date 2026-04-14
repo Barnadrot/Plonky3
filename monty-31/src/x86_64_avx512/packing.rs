@@ -544,10 +544,12 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         let lhs_evn = lhs;
         let rhs_evn = rhs;
 
-        // Copy the odd doublewords into even positions. Using `vpsrlq<32>` for one operand
-        // routes it to the shift port instead of the shuffle port, potentially relieving
-        // shuffle-port pressure on Zen 4 (movshdup_epi32 for the other stays on FP shuffle).
-        let lhs_odd = x86_64::_mm512_srli_epi64::<32>(lhs);
+        // Copy the odd doublewords into even positions to compute the eight products at odd
+        // positions.
+        // NB: The odd doublewords are ignored by `vpmuludq`, so we have a lot of choices for how to
+        // do this; `vmovshdup` is nice because it runs on a memory port if the operand is in
+        // memory, thus improving our throughput.
+        let lhs_odd = movehdup_epi32(lhs);
         let rhs_odd = movehdup_epi32(rhs);
 
         let prod_evn = x86_64::_mm512_mul_epu32(lhs_evn, rhs_evn);
