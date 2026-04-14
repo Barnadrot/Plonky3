@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use p3_baby_bear::BabyBear;
 use p3_dft::{Radix2Bowers, Radix2DFTSmallBatch, Radix2Dit, Radix2DitParallel, TwoAdicSubgroupDft};
 use p3_field::extension::{BinomialExtensionField, Complex};
@@ -194,9 +194,15 @@ where
 
         let dft = Dft::default();
         group.bench_with_input(BenchmarkId::from_parameter(n), &dft, |b, dft| {
-            b.iter(|| {
-                dft.coset_lde_batch(messages.clone(), 1, F::GENERATOR);
-            });
+            // Clone the input *outside* the measured region via `iter_batched` so the 1 GB
+            // `messages.clone()` (and its page-faulting cost) is excluded from the timing.
+            // LargeInput tells Criterion to use a small batch size appropriate for inputs
+            // that are expensive to prepare.
+            b.iter_batched(
+                || messages.clone(),
+                |m| dft.coset_lde_batch(m, 1, F::GENERATOR),
+                BatchSize::LargeInput,
+            );
         });
     }
 }
