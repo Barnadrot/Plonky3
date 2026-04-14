@@ -581,9 +581,10 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         // we check for underflow to generate a mask, and then conditionally add `P`. The underflow
         // check runs on port 5, increasing our throughput, although it does cost us an additional
         // cycle of latency.
-        let underflow = x86_64::_mm512_cmplt_epu32_mask(prod_hi, q_p_hi);
+        // Zen 4 has no Intel port 0/5 split — use the short-latency `vpminud` form.
         let t = x86_64::_mm512_sub_epi32(prod_hi, q_p_hi);
-        x86_64::_mm512_mask_add_epi32(t, underflow, t, MPAVX512::PACKED_P)
+        let u = x86_64::_mm512_add_epi32(t, MPAVX512::PACKED_P);
+        x86_64::_mm512_min_epu32(t, u)
     }
 }
 
