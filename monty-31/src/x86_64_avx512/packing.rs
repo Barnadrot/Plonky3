@@ -560,28 +560,16 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         let q_evn = x86_64::_mm512_mul_epu32(prod_evn, MPAVX512::PACKED_MU);
         let q_odd = x86_64::_mm512_mul_epu32(prod_odd, MPAVX512::PACKED_MU);
 
-        // Get all the high halves as one vector: this is `(lhs * rhs) >> 32`.
-        // NB: `vpermt2d` may feel like a more intuitive choice here, but it has much higher
-        // latency.
-        let prod_hi = mask_movehdup_epi32(prod_odd, EVENS, prod_evn);
-
-        // Normally we'd want to mask to perform % 2**32, but the instruction below only reads the
-        // low 32 bits anyway.
         let q_p_evn = x86_64::_mm512_mul_epu32(q_evn, MPAVX512::PACKED_P);
         let q_p_odd = x86_64::_mm512_mul_epu32(q_odd, MPAVX512::PACKED_P);
 
-        // We can ignore all the low halves of `q_p` as they cancel out. Get all the high halves as
-        // one vector.
-        let q_p_hi = mask_movehdup_epi32(q_p_odd, EVENS, q_p_evn);
-
-        // Subtraction `prod_hi - q_p_hi` modulo `P`.
-        // NB: Normally we'd `vpaddd P` and take the `vpminud`, but `vpminud` runs on port 0, which
-        // is already under a lot of pressure performing multiplications. To relieve this pressure,
-        // we check for underflow to generate a mask, and then conditionally add `P`. The underflow
-        // check runs on port 5, increasing our throughput, although it does cost us an additional
-        // cycle of latency.
-        // Zen 4 has no Intel port 0/5 split — use the short-latency `vpminud` form.
-        let t = x86_64::_mm512_sub_epi32(prod_hi, q_p_hi);
+        // Fuse `extract prod_hi`, `extract q_p_hi`, `prod_hi - q_p_hi` into per-lane 64-bit
+        // subtraction. By Montgomery construction low32(q_p) == low32(prod), so low32(diff)==0
+        // (no borrow) and high32(diff) == prod_hi - q_p_hi exactly. Saves one `vmovshdup`
+        // (prod_hi no longer computed separately).
+        let diff_evn = x86_64::_mm512_sub_epi64(prod_evn, q_p_evn);
+        let diff_odd = x86_64::_mm512_sub_epi64(prod_odd, q_p_odd);
+        let t = mask_movehdup_epi32(diff_odd, EVENS, diff_evn);
         let u = x86_64::_mm512_add_epi32(t, MPAVX512::PACKED_P);
         x86_64::_mm512_min_epu32(t, u)
     }
