@@ -195,7 +195,7 @@ impl<F: TwoAdicField + Ord> TwoAdicSubgroupDft<F> for Radix2DitParallel<F> {
 
         let lde_elems = w * (h << added_bits);
         let elems_to_add = lde_elems - w * h;
-        debug_span!("reserve_exact").in_scope(|| mat.values.reserve_exact(elems_to_add));
+        debug_span!("reserve_exact").in_scope(|| mat.values.reserve(elems_to_add));
 
         let g_big = F::two_adic_generator(log_h + added_bits);
 
