@@ -576,12 +576,14 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         let q_p_hi = mask_movehdup_epi32(q_p_odd, EVENS, q_p_evn);
 
         // Subtraction `prod_hi - q_p_hi` modulo `P`.
-        // On AMD Zen 4 the Intel-style port 0/5 split doesn't apply, and `vpminud` (1-cyc latency)
-        // beats the `vpcmpud`+`vpaddd` mask form (4 cyc total). Use the short-latency form here
-        // to shave cycles off the `mul` critical path (21 → ~19 cyc).
+        // NB: Normally we'd `vpaddd P` and take the `vpminud`, but `vpminud` runs on port 0, which
+        // is already under a lot of pressure performing multiplications. To relieve this pressure,
+        // we check for underflow to generate a mask, and then conditionally add `P`. The underflow
+        // check runs on port 5, increasing our throughput, although it does cost us an additional
+        // cycle of latency.
+        let underflow = x86_64::_mm512_cmplt_epu32_mask(prod_hi, q_p_hi);
         let t = x86_64::_mm512_sub_epi32(prod_hi, q_p_hi);
-        let u = x86_64::_mm512_add_epi32(t, MPAVX512::PACKED_P);
-        x86_64::_mm512_min_epu32(t, u)
+        x86_64::_mm512_mask_add_epi32(t, underflow, t, MPAVX512::PACKED_P)
     }
 }
 
