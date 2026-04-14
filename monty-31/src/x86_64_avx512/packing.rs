@@ -561,28 +561,22 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         let q_evn = confuse_compiler(x86_64::_mm512_mul_epu32(prod_evn, MPAVX512::PACKED_MU));
         let q_odd = confuse_compiler(x86_64::_mm512_mul_epu32(prod_odd, MPAVX512::PACKED_MU));
 
-        // Get all the high halves as one vector: this is `(lhs * rhs) >> 32`.
-        // NB: `vpermt2d` may feel like a more intuitive choice here, but it has much higher
-        // latency.
-        let prod_hi = mask_movehdup_epi32(prod_odd, EVENS, prod_evn);
-
         // Normally we'd want to mask to perform % 2**32, but the instruction below only reads the
         // low 32 bits anyway.
         let q_p_evn = x86_64::_mm512_mul_epu32(q_evn, MPAVX512::PACKED_P);
         let q_p_odd = x86_64::_mm512_mul_epu32(q_odd, MPAVX512::PACKED_P);
 
-        // We can ignore all the low halves of `q_p` as they cancel out. Get all the high halves as
-        // one vector.
-        let q_p_hi = mask_movehdup_epi32(q_p_odd, EVENS, q_p_evn);
+        // Fuse the "extract high halves" and "prod_hi - q_p_hi" steps into a 64-bit subtract.
+        // By Montgomery construction, `(q_p) mod 2^32 == prod mod 2^32`, so the low 32 bits of
+        // each 64-bit diff are zero (no borrow) and the high 32 bits are `prod_hi - q_p_hi`
+        // exactly (signed 32-bit). This saves one `vmovshdup` (we build `diff_hi` directly from
+        // diff_evn / diff_odd) compared to computing `prod_hi` and `q_p_hi` separately.
+        let diff_evn = x86_64::_mm512_sub_epi64(prod_evn, q_p_evn);
+        let diff_odd = x86_64::_mm512_sub_epi64(prod_odd, q_p_odd);
+        let t = mask_movehdup_epi32(diff_odd, EVENS, diff_evn);
 
-        // Subtraction `prod_hi - q_p_hi` modulo `P`.
-        // NB: Normally we'd `vpaddd P` and take the `vpminud`, but `vpminud` runs on port 0, which
-        // is already under a lot of pressure performing multiplications. To relieve this pressure,
-        // we check for underflow to generate a mask, and then conditionally add `P`. The underflow
-        // check runs on port 5, increasing our throughput, although it does cost us an additional
-        // cycle of latency.
-        let underflow = x86_64::_mm512_cmplt_epu32_mask(prod_hi, q_p_hi);
-        let t = x86_64::_mm512_sub_epi32(prod_hi, q_p_hi);
+        // `t` holds signed 32-bit values in (-P, P). Add P under mask if negative.
+        let underflow = x86_64::_mm512_movepi32_mask(t);
         x86_64::_mm512_mask_add_epi32(t, underflow, t, MPAVX512::PACKED_P)
     }
 }
