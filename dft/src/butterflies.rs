@@ -183,19 +183,27 @@ impl<F: Field> Butterfly<F> for DitButterfly<F> {
         (x_1 + x_2_twiddle, x_1 - x_2_twiddle)
     }
 
-    /// Override `apply_to_rows` to pre-broadcast the twiddle factor into a packed field
-    /// once before the inner loop, avoiding a scalar-to-vector broadcast on each packed
-    /// multiplication. For wide rows (e.g., 256 columns with AVX512 width=16, giving 16
-    /// packed iterations per row-pair), this eliminates 15 redundant broadcasts per call.
+    /// Override `apply_to_rows` with manual unroll-by-2 across adjacent packed (x_1, x_2)
+    /// pairs — exposes two independent mul chains so the ~21-cyc Montgomery mul latency
+    /// can overlap.
     #[inline]
     fn apply_to_rows(&self, row_1: &mut [F], row_2: &mut [F]) {
         let (shorts_1, suffix_1) = F::Packing::pack_slice_with_suffix_mut(row_1);
         let (shorts_2, suffix_2) = F::Packing::pack_slice_with_suffix_mut(row_2);
         debug_assert_eq!(shorts_1.len(), shorts_2.len());
         debug_assert_eq!(suffix_1.len(), suffix_2.len());
-        // Pre-broadcast the scalar twiddle into a packed field once outside the loop.
         let twiddle_packed = F::Packing::from(self.0);
-        for (x_1, x_2) in shorts_1.iter_mut().zip(shorts_2.iter_mut()) {
+        let mut c1 = shorts_1.chunks_exact_mut(2);
+        let mut c2 = shorts_2.chunks_exact_mut(2);
+        for (p1, p2) in (&mut c1).zip(&mut c2) {
+            let a1 = p1[0]; let b1 = p1[1];
+            let a2 = p2[0]; let b2 = p2[1];
+            let a2t = a2 * twiddle_packed;
+            let b2t = b2 * twiddle_packed;
+            p1[0] = a1 + a2t; p2[0] = a1 - a2t;
+            p1[1] = b1 + b2t; p2[1] = b1 - b2t;
+        }
+        for (x_1, x_2) in c1.into_remainder().iter_mut().zip(c2.into_remainder().iter_mut()) {
             let x_2_twiddle = *x_2 * twiddle_packed;
             let new_x1 = *x_1 + x_2_twiddle;
             *x_2 = *x_1 - x_2_twiddle;
