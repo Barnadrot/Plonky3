@@ -193,15 +193,19 @@ impl<F: Field> Butterfly<F> for DitButterfly<F> {
         debug_assert_eq!(shorts_1.len(), shorts_2.len());
         debug_assert_eq!(suffix_1.len(), suffix_2.len());
         let twiddle_packed = F::Packing::from(self.0);
-        let mut c1 = shorts_1.chunks_exact_mut(2);
-        let mut c2 = shorts_2.chunks_exact_mut(2);
+        let mut c1 = shorts_1.chunks_exact_mut(4);
+        let mut c2 = shorts_2.chunks_exact_mut(4);
         for (p1, p2) in (&mut c1).zip(&mut c2) {
-            let a1 = p1[0]; let b1 = p1[1];
-            let a2 = p2[0]; let b2 = p2[1];
+            let a1 = p1[0]; let b1 = p1[1]; let c1_ = p1[2]; let d1 = p1[3];
+            let a2 = p2[0]; let b2 = p2[1]; let c2_ = p2[2]; let d2 = p2[3];
             let a2t = a2 * twiddle_packed;
             let b2t = b2 * twiddle_packed;
+            let c2t = c2_ * twiddle_packed;
+            let d2t = d2 * twiddle_packed;
             p1[0] = a1 + a2t; p2[0] = a1 - a2t;
             p1[1] = b1 + b2t; p2[1] = b1 - b2t;
+            p1[2] = c1_ + c2t; p2[2] = c1_ - c2t;
+            p1[3] = d1 + d2t; p2[3] = d1 - d2t;
         }
         for (x_1, x_2) in c1.into_remainder().iter_mut().zip(c2.into_remainder().iter_mut()) {
             let x_2_twiddle = *x_2 * twiddle_packed;
