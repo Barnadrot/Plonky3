@@ -549,7 +549,8 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         // NB: The odd doublewords are ignored by `vpmuludq`, so we have a lot of choices for how to
         // do this; `vmovshdup` is nice because it runs on a memory port if the operand is in
         // memory, thus improving our throughput.
-        let lhs_odd = movehdup_epi32(lhs);
+        // Use vpsrlq<32> for lhs_odd — different port than vmovshdup, spreads load.
+        let lhs_odd = x86_64::_mm512_srli_epi64::<32>(lhs);
         let rhs_odd = movehdup_epi32(rhs);
 
         let prod_evn = x86_64::_mm512_mul_epu32(lhs_evn, rhs_evn);
