@@ -194,22 +194,8 @@ impl<F: TwoAdicField + Ord> TwoAdicSubgroupDft<F> for Radix2DitParallel<F> {
         // We skip the final bit-reversal, since the next FFT expects bit-reversed input.
 
         let lde_elems = w * (h << added_bits);
-        // Instead of `reserve_exact` (which often triggers realloc+memcpy+free on large
-        // inputs), allocate a fresh buffer at final size and move the already-DFT'd values
-        // into it. This avoids the hidden copy inside the grow path when the allocator
-        // can't extend the original mapping in place.
-        debug_span!("alloc_output_buffer").in_scope(|| {
-            let mut new_values: Vec<F> = Vec::with_capacity(lde_elems);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    mat.values.as_ptr(),
-                    new_values.as_mut_ptr(),
-                    w * h,
-                );
-                new_values.set_len(w * h);
-            }
-            mat.values = new_values;
-        });
+        let elems_to_add = lde_elems - w * h;
+        debug_span!("reserve_exact").in_scope(|| mat.values.reserve_exact(elems_to_add));
 
         let g_big = F::two_adic_generator(log_h + added_bits);
 
