@@ -187,10 +187,6 @@ impl<F: Field> Butterfly<F> for DitButterfly<F> {
     /// once before the inner loop, avoiding a scalar-to-vector broadcast on each packed
     /// multiplication. For wide rows (e.g., 256 columns with AVX512 width=16, giving 16
     /// packed iterations per row-pair), this eliminates 15 redundant broadcasts per call.
-    ///
-    /// Manually unrolled by 2 to expose instruction-level parallelism across adjacent
-    /// (x_1, x_2) pairs: both multiplications can be in flight simultaneously, hiding
-    /// the ~21-cycle Montgomery `mul` latency on AVX-512.
     #[inline]
     fn apply_to_rows(&self, row_1: &mut [F], row_2: &mut [F]) {
         let (shorts_1, suffix_1) = F::Packing::pack_slice_with_suffix_mut(row_1);
@@ -199,22 +195,7 @@ impl<F: Field> Butterfly<F> for DitButterfly<F> {
         debug_assert_eq!(suffix_1.len(), suffix_2.len());
         // Pre-broadcast the scalar twiddle into a packed field once outside the loop.
         let twiddle_packed = F::Packing::from(self.0);
-        let mut chunks_1 = shorts_1.chunks_exact_mut(2);
-        let mut chunks_2 = shorts_2.chunks_exact_mut(2);
-        for (p1, p2) in (&mut chunks_1).zip(&mut chunks_2) {
-            let a1 = p1[0];
-            let b1 = p1[1];
-            let a2 = p2[0];
-            let b2 = p2[1];
-            // Issue both muls first — independent, can pipeline.
-            let a2t = a2 * twiddle_packed;
-            let b2t = b2 * twiddle_packed;
-            p1[0] = a1 + a2t;
-            p2[0] = a1 - a2t;
-            p1[1] = b1 + b2t;
-            p2[1] = b1 - b2t;
-        }
-        for (x_1, x_2) in chunks_1.into_remainder().iter_mut().zip(chunks_2.into_remainder().iter_mut()) {
+        for (x_1, x_2) in shorts_1.iter_mut().zip(shorts_2.iter_mut()) {
             let x_2_twiddle = *x_2 * twiddle_packed;
             let new_x1 = *x_1 + x_2_twiddle;
             *x_2 = *x_1 - x_2_twiddle;
@@ -246,30 +227,10 @@ impl<F: Field> Butterfly<F> for DitButterfly<F> {
         debug_assert_eq!(dst_suffix_1.len(), dst_suffix_2.len());
         // Pre-broadcast the scalar twiddle into a packed field once outside the loop.
         let twiddle_packed = F::Packing::from(self.0);
-        // Unrolled by 2 to hide 21-cyc Montgomery mul latency by issuing independent muls.
-        let n = src_shorts_1.len();
-        let n2 = n - (n & 1);
-        let mut i = 0;
-        while i < n2 {
-            let a1 = src_shorts_1[i];
-            let b1 = src_shorts_1[i + 1];
-            let a2 = src_shorts_2[i];
-            let b2 = src_shorts_2[i + 1];
-            let a2t = a2 * twiddle_packed;
-            let b2t = b2 * twiddle_packed;
-            dst_shorts_1[i].write(a1 + a2t);
-            dst_shorts_2[i].write(a1 - a2t);
-            dst_shorts_1[i + 1].write(b1 + b2t);
-            dst_shorts_2[i + 1].write(b1 - b2t);
-            i += 2;
-        }
-        while i < n {
-            let s1 = src_shorts_1[i];
-            let s2 = src_shorts_2[i];
-            let x_2_twiddle = s2 * twiddle_packed;
-            dst_shorts_1[i].write(s1 + x_2_twiddle);
-            dst_shorts_2[i].write(s1 - x_2_twiddle);
-            i += 1;
+        for (s_1, s_2, d_1, d_2) in izip!(src_shorts_1, src_shorts_2, dst_shorts_1, dst_shorts_2) {
+            let x_2_twiddle = *s_2 * twiddle_packed;
+            d_1.write(*s_1 + x_2_twiddle);
+            d_2.write(*s_1 - x_2_twiddle);
         }
         for (s_1, s_2, d_1, d_2) in izip!(src_suffix_1, src_suffix_2, dst_suffix_1, dst_suffix_2) {
             let (res_1, res_2) = self.apply(*s_1, *s_2);
