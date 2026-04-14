@@ -183,19 +183,33 @@ impl<F: Field> Butterfly<F> for DitButterfly<F> {
         (x_1 + x_2_twiddle, x_1 - x_2_twiddle)
     }
 
-    /// Override `apply_to_rows` to pre-broadcast the twiddle factor into a packed field
-    /// once before the inner loop, avoiding a scalar-to-vector broadcast on each packed
-    /// multiplication. For wide rows (e.g., 256 columns with AVX512 width=16, giving 16
-    /// packed iterations per row-pair), this eliminates 15 redundant broadcasts per call.
+    /// Override `apply_to_rows` with manual unroll-by-4 across adjacent packed (x_1, x_2)
+    /// pairs. The Montgomery `mul` on BabyBear AVX-512 has ~21-cyc latency and ~6.5-cyc
+    /// throughput, so ≥4 independent muls should be in flight concurrently to saturate the
+    /// multiplier port. 256-col rows at width=16 give exactly 16 packed iterations — a clean
+    /// multiple of 4 with no remainder.
     #[inline]
     fn apply_to_rows(&self, row_1: &mut [F], row_2: &mut [F]) {
         let (shorts_1, suffix_1) = F::Packing::pack_slice_with_suffix_mut(row_1);
         let (shorts_2, suffix_2) = F::Packing::pack_slice_with_suffix_mut(row_2);
         debug_assert_eq!(shorts_1.len(), shorts_2.len());
         debug_assert_eq!(suffix_1.len(), suffix_2.len());
-        // Pre-broadcast the scalar twiddle into a packed field once outside the loop.
         let twiddle_packed = F::Packing::from(self.0);
-        for (x_1, x_2) in shorts_1.iter_mut().zip(shorts_2.iter_mut()) {
+        let mut c1 = shorts_1.chunks_exact_mut(4);
+        let mut c2 = shorts_2.chunks_exact_mut(4);
+        for (p1, p2) in (&mut c1).zip(&mut c2) {
+            let a1 = p1[0]; let b1 = p1[1]; let c1_ = p1[2]; let d1 = p1[3];
+            let a2 = p2[0]; let b2 = p2[1]; let c2_ = p2[2]; let d2 = p2[3];
+            let a2t = a2 * twiddle_packed;
+            let b2t = b2 * twiddle_packed;
+            let c2t = c2_ * twiddle_packed;
+            let d2t = d2 * twiddle_packed;
+            p1[0] = a1 + a2t; p2[0] = a1 - a2t;
+            p1[1] = b1 + b2t; p2[1] = b1 - b2t;
+            p1[2] = c1_ + c2t; p2[2] = c1_ - c2t;
+            p1[3] = d1 + d2t; p2[3] = d1 - d2t;
+        }
+        for (x_1, x_2) in c1.into_remainder().iter_mut().zip(c2.into_remainder().iter_mut()) {
             let x_2_twiddle = *x_2 * twiddle_packed;
             let new_x1 = *x_1 + x_2_twiddle;
             *x_2 = *x_1 - x_2_twiddle;
