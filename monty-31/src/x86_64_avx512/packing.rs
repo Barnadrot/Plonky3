@@ -555,10 +555,11 @@ fn mul<MPAVX512: MontyParametersAVX512>(lhs: __m512i, rhs: __m512i) -> __m512i {
         let prod_evn = x86_64::_mm512_mul_epu32(lhs_evn, rhs_evn);
         let prod_odd = x86_64::_mm512_mul_epu32(lhs_odd, rhs_odd);
 
-        // On Zen 4 vpmullq is ~3 cyc lat / 1.5 cyc tpt, comparable to vpmuludq; skip confuse_compiler
-        // so the compiler is free to pick the cheaper lowering given surrounding scheduling.
-        let q_evn = x86_64::_mm512_mul_epu32(prod_evn, MPAVX512::PACKED_MU);
-        let q_odd = x86_64::_mm512_mul_epu32(prod_odd, MPAVX512::PACKED_MU);
+        // We throw a confuse compiler here to prevent the compiler from
+        // using vpmullq instead of vpmuludq in the computations for q_p.
+        // vpmullq has both higher latency and lower throughput.
+        let q_evn = confuse_compiler(x86_64::_mm512_mul_epu32(prod_evn, MPAVX512::PACKED_MU));
+        let q_odd = confuse_compiler(x86_64::_mm512_mul_epu32(prod_odd, MPAVX512::PACKED_MU));
 
         // Get all the high halves as one vector: this is `(lhs * rhs) >> 32`.
         // NB: `vpermt2d` may feel like a more intuitive choice here, but it has much higher
