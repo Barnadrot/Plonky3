@@ -57,17 +57,8 @@ fn main() -> Result<(), impl Debug> {
         .init();
 
     prove_and_verify()?;
-
-    #[cfg(feature = "zk-alloc")]
-    p3_zk_alloc::begin_phase();
     prove_and_verify()?;
-
-    #[cfg(feature = "zk-alloc")]
-    p3_zk_alloc::begin_phase();
-    let result = prove_and_verify();
-    #[cfg(feature = "zk-alloc")]
-    p3_zk_alloc::end_phase();
-    result
+    prove_and_verify()
 }
 
 fn prove_and_verify() -> Result<(), impl Debug> {

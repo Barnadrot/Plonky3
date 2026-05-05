@@ -22,6 +22,7 @@ itertools.workspace = true
 serde = { workspace = true, features = ["derive", "alloc"] }
 thiserror.workspace = true
 tracing.workspace = true
+p3-zk-alloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 p3-baby-bear = { path = "../baby-bear" }
@@ -41,6 +42,7 @@ rand.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+zk-alloc = ["dep:p3-zk-alloc"]
 
 [lints]
 workspace = true

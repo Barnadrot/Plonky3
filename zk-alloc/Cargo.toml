@@ -9,7 +9,13 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["rayon-flush"]
+rayon-flush = ["rayon"]
+
 [dependencies]
+rayon = { version = "1.10", optional = true }
+
 
 [target.'cfg(all(target_family = "unix", not(all(target_os = "linux", target_arch = "x86_64"))))'.dependencies]
 libc = "0.2"

@@ -36,6 +36,9 @@ where
     SC: StarkGenericConfig,
     A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
 {
+    #[cfg(feature = "zk-alloc")]
+    p3_zk_alloc::begin_phase();
+
     #[cfg(debug_assertions)]
     p3_air::check_constraints(air, &trace, public_values);
 
@@ -369,12 +372,17 @@ where
         quotient_chunks,
         random,
     };
-    Proof {
+    let proof = Proof {
         commitments,
         opened_values,
         opening_proof,
         degree_bits: log_ext_degree,
-    }
+    };
+
+    #[cfg(feature = "zk-alloc")]
+    p3_zk_alloc::end_phase();
+
+    proof
 }
 
 #[instrument(skip_all)]

@@ -127,6 +127,16 @@ pub fn begin_phase() {
 /// pointers stay valid until the next `begin_phase()` resets the slabs.
 pub fn end_phase() {
     ARENA_ACTIVE.store(false, Ordering::Release);
+    #[cfg(feature = "rayon-flush")]
+    flush_rayon();
+}
+
+#[cfg(feature = "rayon-flush")]
+fn flush_rayon() {
+    const FLUSH_JOBS: usize = 256;
+    for _ in 0..FLUSH_JOBS {
+        rayon::join(|| {}, || {});
+    }
 }
 
 /// Returns (overflow_count, overflow_bytes) — allocations that fell through to System
