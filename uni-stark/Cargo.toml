@@ -22,7 +22,7 @@ itertools.workspace = true
 serde = { workspace = true, features = ["derive", "alloc"] }
 thiserror.workspace = true
 tracing.workspace = true
-p3-zk-alloc = { workspace = true, optional = true }
+p3-zk-alloc = { workspace = true, optional = true, default-features = false }
 
 [dev-dependencies]
 p3-baby-bear = { path = "../baby-bear" }

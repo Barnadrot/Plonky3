@@ -30,7 +30,7 @@ p3-koala-bear = { path = "../koala-bear" }
 p3-merkle-tree = { path = "../merkle-tree" }
 p3-symmetric = { path = "../symmetric" }
 p3-uni-stark = { path = "../uni-stark" }
-p3-zk-alloc = { path = "../zk-alloc" }
+p3-zk-alloc = { path = "../zk-alloc", default-features = false }
 
 tracing-forest = { workspace = true, features = ["ansi", "smallvec"] }
 tracing-subscriber = { workspace = true, features = ["std", "env-filter"] }

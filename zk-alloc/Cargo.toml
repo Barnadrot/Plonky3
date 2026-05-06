@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["rayon-flush"]
+default = []
 rayon-flush = ["rayon"]
 
 [dependencies]
