@@ -608,10 +608,25 @@ where
     #[allow(clippy::suspicious_arithmetic_impl)]
     #[inline]
     fn div(self, rhs: Self) -> Self {
-        let mut rhs_inv = Self::broadcast(QuinticTrinomialExtensionField::<F>::ZERO);
-        crate::batch_multiplicative_inverse_general(rhs.as_slice(), rhs_inv.as_slice_mut(), |x| {
-            x.inverse()
-        });
+        // Gather lane i's scalar quintic extension element from the SoA
+        // store [PF; 5], invert, and re-pack. Avoid `<Self as PackedValue>::as_slice` /
+        // `as_slice_mut`: their raw transmute confuses the SoA layout
+        // with AoS and corrupts the per-lane reduction state used by
+        // Montgomery's trick.
+        let scalars: alloc::vec::Vec<QuinticTrinomialExtensionField<F>> = (0..PF::WIDTH)
+            .map(|i| {
+                QuinticTrinomialExtensionField::<F>::new([
+                    rhs.value[0].as_slice()[i],
+                    rhs.value[1].as_slice()[i],
+                    rhs.value[2].as_slice()[i],
+                    rhs.value[3].as_slice()[i],
+                    rhs.value[4].as_slice()[i],
+                ])
+            })
+            .collect();
+        let mut inverses = alloc::vec![QuinticTrinomialExtensionField::<F>::ZERO; PF::WIDTH];
+        crate::batch_multiplicative_inverse_general(&scalars, &mut inverses, |x| x.inverse());
+        let rhs_inv = Self::from_fn(|i| inverses[i]);
         self * rhs_inv
     }
 }

@@ -599,7 +599,19 @@ where
     #[allow(clippy::suspicious_arithmetic_impl)]
     #[inline]
     fn div(self, rhs: Self) -> Self {
-        let rhs_inv = Self::from_fn(|i| rhs.as_slice()[i].inverse());
+        // Per-lane inverse: gather lane i's scalar coordinates from the SoA
+        // store [PF; 3], reconstruct the scalar cubic extension element,
+        // and invert. Note: do NOT use `<Self as PackedValue>::as_slice` here
+        // — its raw transmute confuses the SoA layout with AoS and returns
+        // wrong lane values.
+        let rhs_inv = Self::from_fn(|i| {
+            let lane = CubicTrinomialExtensionField::new([
+                rhs.value[0].as_slice()[i],
+                rhs.value[1].as_slice()[i],
+                rhs.value[2].as_slice()[i],
+            ]);
+            lane.inverse()
+        });
         self * rhs_inv
     }
 }
