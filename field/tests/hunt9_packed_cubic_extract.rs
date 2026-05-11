@@ -31,14 +31,20 @@ fn ce(a: u64, b: u64, c: u64) -> CExt {
 fn packed_field_extension_extract_is_correct() {
     let width = PCExt::WIDTH;
     let inputs: Vec<CExt> = (0..width)
-        .map(|i| ce((i * 100 + 1) as u64, (i * 100 + 2) as u64, (i * 100 + 3) as u64))
+        .map(|i| {
+            ce(
+                (i * 100 + 1) as u64,
+                (i * 100 + 2) as u64,
+                (i * 100 + 3) as u64,
+            )
+        })
         .collect();
     let packed = PCExt::from_fn(|i| inputs[i]);
 
-    for lane in 0..width {
+    for (lane, input) in inputs.iter().enumerate().take(width) {
         let extracted = <PCExt as PackedFieldExtension<F, CExt>>::extract(&packed, lane);
         assert_eq!(
-            extracted, inputs[lane],
+            extracted, *input,
             "PackedFieldExtension::extract returns wrong lane value at lane {lane}"
         );
     }

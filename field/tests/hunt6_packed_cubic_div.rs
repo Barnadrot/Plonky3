@@ -12,12 +12,12 @@
 //! `numer.lane(i) / denom.lane(i)` reference for any input where the
 //! garbled triple differs from lane i.
 
+#[allow(unused_imports)]
+use p3_field::PrimeField64;
 use p3_field::extension::{CubicTrinomialExtensionField, PackedCubicTrinomialExtensionField};
 use p3_field::integers::QuotientMap;
 use p3_field::{BasedVectorSpace, PackedValue};
-use p3_goldilocks::Goldilocks;
-#[allow(unused_imports)]
-use p3_field::PrimeField64; // for as_canonical_u64 if needed
+use p3_goldilocks::Goldilocks; // for as_canonical_u64 if needed
 
 type F = Goldilocks;
 type PF = <F as p3_field::Field>::Packing;
@@ -37,7 +37,13 @@ fn div_lane_matches_scalar_div() {
         .map(|i| ce((i + 1) as u64, (2 * i + 1) as u64, (3 * i + 1) as u64))
         .collect();
     let dens: Vec<CExt> = (0..width)
-        .map(|i| ce((10 * i + 7) as u64, (10 * i + 11) as u64, (10 * i + 13) as u64))
+        .map(|i| {
+            ce(
+                (10 * i + 7) as u64,
+                (10 * i + 11) as u64,
+                (10 * i + 13) as u64,
+            )
+        })
         .collect();
 
     let p_num = PCExt::from_fn(|i| nums[i]);
